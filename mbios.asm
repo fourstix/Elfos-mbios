@@ -763,7 +763,7 @@ chekbad:    sep   scall                 ; if mismatch, display checksum
 
 chekcpu:    sep   scall
             dw    f_inmsg
-            db    'BIOS: V.2.3.1 (Mini/BIOS)',13,10,0
+            db    'BIOS: V.2.4.0 (Mini/BIOS)',13,10,0
 
             db    68h                   ; will only jump on 1802
             lbr   cdp1802
@@ -1874,12 +1874,12 @@ secloop:    lda   r9                     ; copy two bytes per loop
             org   0f700h
 
           ; The decompression algorithm is that from Einar Saukas's standard
-          ; Z80 ZX1 decompressor, but is completely rewriten due to how very
+          ; Z80 ZX0 decompressor, but is completely rewriten due to how very
           ; different the 1802 instruction set and architecture is.
           ;
-          ; For background please see https://github.com/einar-saukas/ZX1
+          ; For background please see https://github.com/einar-saukas/ZX0
           ;
-          ; Note that while the ZX1 algorithm is used here, the actual code
+          ; Note that while the ZX0 algorithm is used here, the actual code
           ; is an original work, and so the original license does not apply.
           ;
           ; R9   - Destination pointer
@@ -1889,21 +1889,29 @@ secloop:    lda   r9                     ; copy two bytes per loop
           ; RD   - Source pointer
           ; RE.0 - Single bit buffer
 
-decompr:    ldi   -1                    ; last offset defaults to one
-            phi   rb
-            plo   rb
-
-            ldi   80h                   ; prime the pump for elias
+decompr:    ldi   %10000000             ; empty the elias shift register
             plo   re
 
+            shl                         ; zero the block length counter
+            phi   rc
+            plo   rc
+
+            phi   rb                    ; default block copy offset is -1
+            plo   rb
+            dec   rb
 
           ; The first block in a stream is always a literal block so the type
-          ; bit is not even sent, and we can jump in right at that point.
+          ; bit is not even sent, and we can jump in right at that point. We
+          ; just get the block length and copy from source to destination.
+          ;
+          ; Note that the first bit of an Elias coded number is implied, so
+          ; we need to preset the lowest bit pefore getting the rest. Since
+          ; RC will always be zero on entry, this can be done with INC only.
 
-literal:    glo   r3                    ; get literal block length
-            br    elias
+literal:    glo   r3                    ; get the length of the block
+            br    eliread
 
-copylit:    lda   rd                    ; copy byte from input stream
+copylit:    lda   rd                    ; copy byte from source data
             str   r9
             inc   r9
 
@@ -1913,20 +1921,21 @@ copylit:    lda   rd                    ; copy byte from input stream
             ghi   rc
             bnz   copylit
 
+          ; A literal is always followed by a copy block. The next input bit 
+          ; indicates if is from a new offset or the same offset as last.
 
-          ; After a literal block must be a copy block and the next bit
-          ; indicates if is is from a new offset or the same offset as last.
-
-            glo   re                    ; get next bit, see if new offset
+            glo   re                    ; get next bit from input stream
             shl
             plo   re
-            bdf   newoffs
 
+            bdf   newoffs               ; new offset follows if bit is set
 
-          ; Next block is from the same offset as last block.
+          ; Process a copy block by getting the block length and copying from
+          ; the output buffer from where the offset points backwards to. Note
+          ; that the offset is negative, so we add it to go backwards.
 
-            glo   r3                    ; get same offset block length
-            br    elias
+            glo   r3                    ; same offset so just get length
+            br    eliread
 
 copyblk:    glo   rb                    ; offset plus position is source
             str   r2
@@ -1939,16 +1948,15 @@ copyblk:    glo   rb                    ; offset plus position is source
             adc
             phi   ra
 
-copyoff:    lda   ra                     ; copy byte from source
+copyoff:    lda   ra                     ; copy byte from source data
             str   r9
             inc   r9
 
-            dec   rc                     ; repeat for all bytes
+            dec   rc                     ; loop until all bytes copied
             glo   rc
             bnz   copyoff
             ghi   rc
             bnz   copyoff
-
 
           ; After a copy from same offset, the next block must be either a
           ; literal or a copy from new offset, the next bit indicates which.
@@ -1956,85 +1964,93 @@ copyoff:    lda   ra                     ; copy byte from source
             glo   re                     ; check if literal next
             shl
             plo   re
-            bnf   literal
 
+            bnf   literal                ; literal block follows if bit clear
 
-          ; Next block is to be coped from a new offset value.
+          ; The next block is to be copied from a new offset. The value is
+          ; stored in two parts, the high bits are Elias-coded, but the low
+          ; 7 bits are not and are stored left-aligned in a byte. The lowest
+          ; bit of that byte is used to hold the first bit of the length.
+          ;
+          ; Since the first bit of the Elias part is implied and a negative
+          ; number, we need to preload the value with all ones plus a zero
+          ; bit. This can be done by DEC, DEC from the starting zero value.
 
-newoffs:    ldi   -1                     ; msb for one-byte offset
+newoffs:    dec   rc                     ; negative value so set to 11111110
+            dec   rc
+
+            glo   r3                     ; get the elias-coded offset value
+            br    elictrl
+
+            inc   rc                     ; adjust and test for end of file
+            glo   rc
+            bz    endfile
+
+            shrc                         ; shift and combine with low byte
             phi   rb
-
-            lda   rd                     ; get lsb of offset, drop low bit
-            shrc                         ;  while setting highest bit to 1
+            lda   rd
+            shrc
             plo   rb
 
-            bnf   msbskip                ; if offset is only one byte
+            ldi   0                      ; clear since length is positive
+            phi   rc
+            plo   rc
+            inc   rc
 
-            lda   rd                     ; get msb of offset, drop low bit
-            shrc                         ;  while seting highest bit to 1
-            phi   rb
+            glo   r3                     ; get length of the copy block
+            bnf   elidata
 
-            glo   rb                     ; replace lowest bit from msb into
-            shlc                         ;  the lowest bit of lsb
-            plo   rb
-
-            ghi   rb                     ; high byte is offset by one
-            adi   1
-            phi   rb
-
-            bz    endfile                ; if not end of file marker
-
-msbskip:    glo   r3                     ; get length of block
-            br    elias
-
-            inc   rc                     ; new offset is one less
-
-            br    copyblk                ; do the copy
+            inc   rc                     ; adjust offset and copy the block
+            br    copyblk
 
 endfile:    sep   sret
 
-
           ; Subroutine to read an interlaced Elias gamma coded number from
-          ; the bit input stream. This keeps a one-byte buffer in RE.0 and
+          ; the bit input stream. This keeps a one-byte buffer in R7.0 and
           ; reads from the input pointed to by RF as needed, returning the
           ; resulting decoded number in RC.
+          ;
+          ; Note that this is short-subroutine called by jumping to the 
+          ; subroutine with a BR instruction and passing the return address
+          ; in D. This only works within the same page of code but is fast.
 
-elias:      adi   2
-            stxd
+eliread:    inc   rc                    ; set lowest bit (already zeroed)
 
-            ldi   1                     ; set start value at one
-            plo   rc
-            shr
+elictrl:    plo   ra                    ; stash return address for later
+            br    eliloop
 
-eliloop:    phi   rc                    ; save result msb of value
+elidata:    plo   ra                    ; stash return address for later
 
-            glo   re                    ; get control bit from buffer
-            shl
-
-            bnz   eliskip               ; if buffer is not empty
-
-            lda   rd                    ; else get another byte
-            shlc
-
-eliskip:    bnf   elidone               ; if bit is zero then end
-
-            shl                         ; get a data bit from buffer
+            glo   re                    ; get next data bit from buffer
+elicont:    shl
             plo   re
 
-            glo   rc                    ; shift data bit into result
+            glo   rc                    ; shift new data bit into result
             shlc
             plo   rc
             ghi   rc
             shlc
+            phi   rc
 
-            br    eliloop               ; repeat until done
+eliloop:    glo   re                    ; get next control bit from buffer
+            shl
 
-elidone:    plo   re                    ; save back to buffer
+            lsnz                        ; get next byte if buffer is empty
+            lda   rd
+            shlc
 
-            irx                         ; return
-            ldx
+            bnf   elicont               ; loop if not the stop control bit
+
+            plo   re                    ; save bit buffer back to register
+
+            inc   ra                    ; adjust address and return (keep df)
+            inc   ra
+            glo   ra
             plo   r3
 
+         #if decompr.1 != $.1
+         #error decompressor code spans page boundary
+         #endif
 
           ; Find the last address of RAM present in the system. The search
           ; is done with a granularity of one page; this is not reliable
@@ -2672,44 +2688,57 @@ i2azero:    dec   rc                    ; move to next divisor in table,
 divisor:    equ   $-1
 
 
-            ; Get the time of day from the hardware clock into the buffer
-            ; at RF in the order that Elf/OS expects: M, D, Y, H, M, S.
+          ; Get the time of day from the hardware clock into the buffer
+          ; at RF in the order that Elf/OS expects: M, D, Y, H, M, S.
 
-gettod:     sex   r3                    ; output register d address to rtc
+gettod:     glo   rc                    ; save so we can use as table pointer
+            stxd
+            ghi   rd
+            stxd
+
+            sex   r3                    ; output inline arguments
 
           #if RTC_GROUP
             out   EXP_PORT              ; make sure default expander group
             db    RTC_GROUP
           #endif
 
-            out   RTC_PORT
+            out   RTC_PORT              ; select control register d
             db    2dh
 
-            br    todhold               ; go to busy bit check algorithm
+            br    todhold               ; set the time hold bit
 
-todbusy:    sex   r3                    ; clear hold bit
+          ; To avoid the possibility of the time being updated between parts
+          ; of it being read, the RTC provides a BUSY bit to indicate when an
+          ; update is happening, and a HOLD bit to prevent updates. There is
+          ; a particular process to use these bits that is documented in the
+          ; datasheet to prevent race conditions, which is implemented below.
+
+todbusy:    sex   r3                    ; clear the hold bit to set busy
             out   RTC_PORT
             db    10h
 
-todhold:    out   RTC_PORT              ; set hold bit
+todwait:    nop                         ; delay 7x7 cycles (d is 2 on entry)
+            shl
+            bnz   todwait
+
+todhold:    out   RTC_PORT              ; set hold bit before testing busy
             db    11h
 
-            sex   r2                    ; wait until busy bit is clear
+            sex   r2                    ; input port read onto stack
             inp   RTC_PORT
-            ani   02h
+
+            ani   02h                   ; if busy is set, wait and try again
             bnz   todbusy
 
-            glo   rc                    ; save so we can use as table pointer
-            stxd
-            ghi   rd
-            stxd
+          ; At this point, clock updates are blocked, so it's save to read.
 
             ghi   r3                    ; get pointer to register table
             phi   rc
-            ldi   clocktab.0
+            ldi   clkregs.0
             plo   rc
 
-getnext:    sex   rc                    ; output tens address, inc pointer
+todnext:    sex   rc                    ; output tens address, inc pointer
             out   RTC_PORT
 
             sex   r2                    ; input tens and multiply by 10
@@ -2735,7 +2764,7 @@ getnext:    sex   rc                    ; output tens address, inc pointer
             inc   rf
 
             ldn   rc                    ; continue if more digits to fetch
-            bnz   getnext
+            bnz   todnext
 
             sex   r3                    ; clear hold bit
             out   RTC_PORT
@@ -2743,20 +2772,7 @@ getnext:    sex   rc                    ; output tens address, inc pointer
             out   RTC_PORT
             db    10h
 
-todretn:    
-          #if RTC_GROUP
-            out   EXP_PORT              ; make sure default expander group
-            db    NO_GROUP
-          #endif
-
-sretrc:     inc   r2                    ; restore table pointer register
-            lda   r2
-            phi   rc
-            ldn   r2
-            plo   rc
-
-            sep   sret
-
+            br    todretn               ; restore register and return
 
             ; Set the time on the 72421 RTC chip. This reinitializes the
             ; chip when it sets the time so that it can properly setup a
@@ -2777,28 +2793,28 @@ settod:     glo   rc                    ; save so we can use as table pointer
 
             ghi   r3                    ; get pointer to table of data
             phi   rc
-            ldi   clockini.0
+            ldi   clkinit
             plo   rc
 
             sex   rc                    ; port output from table
 
-setinit:    out   RTC_PORT              ; output values until zero reached
+todinit:    out   RTC_PORT              ; output values until zero reached
             ldn   rc
-            bnz   setinit
+            bnz   todinit
 
             inc   rc                    ; skip zero marker and restore x
             sex   r2
 
             ; Now that the chip is initialized, set the time into the chip.
 
-setnext:    ldi   0                     ; clear tens counter
+todloop:    ldi   0                     ; clear tens counter
             plo   re
 
             lda   rf                    ; load value, advance pointer
 
-settens:    inc   re                    ; divide by 10 by subtraction
+todtens:    inc   re                    ; divide by 10 by subtraction
             smi   10
-            bdf   settens
+            bdf   todtens
 
             adi   10h + 10              ; adjust remainder and push to stack
             stxd
@@ -2820,7 +2836,7 @@ settens:    inc   re                    ; divide by 10 by subtraction
             dec   r2                    ; put stack pointer back
 
             ldn   rc                    ; continue if more digits to fetch
-            bnz   setnext
+            bnz   todloop
 
             sex   r3                    ; start the clock running
             out   RTC_PORT
@@ -2828,10 +2844,24 @@ settens:    inc   re                    ; divide by 10 by subtraction
             out   RTC_PORT
             db    14h
             
-            br    todretn               ; restore register and return
+todretn:    
+          #if RTC_GROUP
+            out   EXP_PORT              ; make sure default expander group
+            db    NO_GROUP
+          #endif
 
+sretrc:     inc   r2                    ; restore table pointer register
+            lda   r2
+            phi   rc
+            ldn   r2
+            plo   rc
 
-clockini:   db    2fh,17h
+            sep   sret
+
+          ; Table of address, value pairs to initialize the RTC in a stopped
+          ; and reset state, ready to load a new time.
+
+clkinit:    db    2fh,17h
             db    2eh,10h
             db    2dh,10h
             db    2ch,10h
@@ -2840,18 +2870,12 @@ clockini:   db    2fh,17h
             ; Table of the time-of-day digit addresses in the RTC 72421
             ; chip in the order that Elf/OS presents the date.
 
-clocktab:   db    29h                   ; month
-            db    28h
-            db    27h                   ; day
-            db    26h
-            db    2bh                   ; year
-            db    2ah
-            db    25h                   ; hour
-            db    24h
-            db    23h                   ; minute
-            db    22h
-            db    21h                   ; second
-            db    20h
+clkregs:    db    29h,28h               ; month
+            db    27h,26h               ; day
+            db    2bh,2ah               ; year
+            db    25h,24h               ; hour
+            db    23h,22h               ; minute
+            db    21h,20h               ; second
             db    0
 
 
@@ -4671,7 +4695,7 @@ ret:        plo   re                    ; save d and set x to 2
           #error version is not at 0fff9h
           #endif
 
-version:    db    2,2,3
+version:    db    2,2,4
             db    0,0,0,0               ; checksum
 
             end   start
